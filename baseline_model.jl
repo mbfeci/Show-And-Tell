@@ -21,7 +21,7 @@ function main(args="")
 	
 	w = initweights(KnetArray{Float32}, 1000, 9408, length(vocab) , 0.1);
 
-    state = initstate(KnetArray{Float32},1000,1)
+    	state = initstate(KnetArray{Float32},1000,1)
 	
 	#Directory of Flickr30k Dataset
 	dirImage = pwd()*"/flickr30k-images"
@@ -50,7 +50,7 @@ end
 
 function generateCaption(dirImage, w, state, vocab, nwords)
 	index_to_word = Array(String, length(vocab));
-    for (k,v) in vocab; index_to_word[v] = k; end
+    	for (k,v) in vocab; index_to_word[v] = k; end
 	
 	img = processImage(KnetArray{Float32}, dirImage)
 	inputRNN = mat(simpleConvNet(w,img))'
@@ -60,14 +60,11 @@ function generateCaption(dirImage, w, state, vocab, nwords)
 	for t in 1:nwords
 		ypred = predictNextWord(w, state, input*w[13])
 		input[index] = 0
-
-        index = sample(exp(logp(ypred)))
-		
+        	index = sample(exp(logp(ypred)))
 		if(index_to_word[index]=="</s>")
 			println()
 			return;
 		end
-		
 		print(index_to_word[index], " ")
 		input[index] = 1
     end
@@ -85,15 +82,12 @@ end
 
 
 function processImage(atype, dir)
-
 	img = load(dir)
-    img = Images.imresize(img, (224,224))
+    	img = Images.imresize(img, (224,224))
 	img = permutedims(channelview(img), (3,2,1))
 	img = convert(Array{Float32}, img)
 	img = reshape(img[:,:,1:3],(224,224,3,1))
-	
 	img = convert(atype, img)
-	
 end
 
 
@@ -128,28 +122,25 @@ end
 
 
 function initstate(atype, hidden, batchsize)
-    state = Array(Any,1)
+	state = Array(Any,1)
 	state[1] = randn(batchsize,hidden)
-    return map(s->convert(atype,s), state)
+	return map(s->convert(atype,s), state)
 end
 
 
 function oneHotVector(atype, s, vocab)
 	x = zeros(Float32, 1,length(vocab))
-	
 	index = get(vocab,s,-1)
-	
 	if index != -1
 		x[index] = 1
 	end
-	
 	x = convert(atype,x)
 	return x
 end
 
 
 function initweights(atype, hidden, input, vocab, winit)
-    #=VGG ConvNet parameters
+    	#=VGG ConvNet parameters
 	w = Any[ -0.1+0.2*rand(Float32, 3,3,3,64),  zeros(Float32,1,1,64,1),
 	-0.1 + 0.2*rand(Float32,3,3,64,128), zeros(Float32,1,1,128,1),
 	-0.1 + 0.2*rand(Float32,3,3,128,256), zeros(Float32,1,1,256,1),		
@@ -174,7 +165,7 @@ function initweights(atype, hidden, input, vocab, winit)
 	append!(w, [Whh, Bhh, Wxh, Bxh, Wo, bo, We])
 
 	w = map(k->convert(atype,k), w)
-    return w
+    	return w
 end
 
 
@@ -202,7 +193,7 @@ end
 
 
 function createVocabulary(dataArray)
-    vocab = Dict{String,Int}()
+    	vocab = Dict{String,Int}()
 	get!(vocab, "<s>", 1)       #Special start token
 	get!(vocab, "</s>", 2)      #Special end token
 	for data in dataArray
@@ -210,7 +201,7 @@ function createVocabulary(dataArray)
 			get!(vocab, word, length(vocab)+1)
 		end
 	end
-    return vocab
+    	return vocab
 end
 
 main()
