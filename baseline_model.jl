@@ -22,7 +22,7 @@ function main(args=ARGS)
         ("--epochs"; arg_type=Int; default=3; help="Number of epochs for training.")
         ("--batchsize"; arg_type=Int; default=1; help="Number of sequences to train on in parallel.")
         ("--seqlength"; arg_type=Int; default=25; help="Number of steps to unroll the network for.")
-		("--embed"; arg_type=Int; default=1000; help="Size of the embedded word vector.")
+		("--embed"; arg_type=Int; default=512; help="Size of the embedded word vector.")
         ("--decay"; arg_type=Float64; default=0.5; help="Learning rate decay.")
         ("--lr"; arg_type=Float64; default=1e-1; help="Initial learning rate.")
         ("--gclip"; arg_type=Float64; default=3.0; help="Value to clip the gradient norm at.")
@@ -37,7 +37,7 @@ function main(args=ARGS)
 	o = Dict();
 	o[:atype] = KnetArray{Float32};
 	o[:hidden] = [512];
-	o[:embed] = [512];
+	o[:embed] = 512;
 	o[:batchsize] = 1;
 	o[:lr] = 0.1;
 	o[:decay] = 0.5;
@@ -45,7 +45,9 @@ function main(args=ARGS)
 	o[:epochs] = 3;
 	o[:generate] = 100;
 	o[:image] = imgurl
+	o[:gclip] = 3.0
 	=#
+	
 	dicts, word2index = parse_files(caption_files);
 	println("Dictionary and vocabulary are created, the size of vocabulary is ", length(word2index));
 	w = initweights(o[:atype], o[:hidden], o[:embed], length(word2index) , o[:winit]);
@@ -58,9 +60,8 @@ function main(args=ARGS)
 	
 	#Caption of that particular image:
 	if o[:generate] > 0
-		img = processImage(o[:image], zeros(Float32,224,224,3,1))
 		new_state = initstate(o[:atype],o[:hidden],o[:batchsize])
-		generateCaption(img, w, new_state, word2index, o[:generate])
+		generateCaption(o[:image], w, new_state, word2index, o[:generate])
 	end
 end
 
@@ -69,14 +70,15 @@ function loss(w,s,img,sequence,range=1:length(sequence)-1)
     total = 0.0; count = 0
 	
 	#Do we want to train CNN as well?
-	encoded_image = simpleConvNet(img)
+	encoded_image = simpleConvNet(w,img)
 	rnn(w,s,encoded_image);
 	
     for t in range
-		prediction = rnn(w,s,sequence[t])
+		prediction = rnn(w,s,sequence[t]*w[end])
 		total += sum(sequence[t+1].*logp(prediction, 2))
 		count += size(sequence[t],1)
     end
+	
     return -total / count
 end
 
@@ -87,26 +89,29 @@ function train(w, ids, sequence, word2index, o)
 	state = initstate(o[:atype],o[:hidden],o[:batchsize])
 	lr = o[:lr]
 	prev_id = 0
+	img = 0
 	for epoch = 1:o[:epochs]
-		index = 1
+		count = 1
 		for id in ids
 			if prev_id!=id
 				imageloc = "data/flickr30k-images/$id.jpg";
 				img = processImage(imageloc, zeros(Float32,224,224,3,1))
 			end
 			
-			for seq in sequence[index]
+			sentence = map(k->convert(o[:atype], k),sequence[count])
 				
-				sentence = convert(o[:atype], seq)
+			gloss = lossgradient(w,copy(state),img,sentence)
 				
-				gloss = lossgradient(w,state,img,sentence)
-		
-				update!(w, gloss; lr=lr, gclip=o[:gclip])
-				
+			for j in 1:length(w)
+				update!(w[j], gloss[j]; lr=lr)
 			end
-			println("$id is finished.");
+
+			println(Knet.gpufree())
+			count = count + 1
+			count%4==0 && println("$id is finished.");
 			prev_id = id
 		end
+		
 		if epochs % 5 == 0
 			lr *= o[:decay]
 		end
@@ -125,11 +130,13 @@ function prepare_data(dict, word2index)
 		no = seq[2][1];
 		words = seq[2][2];
 		
-		sentence = [ falses(1, vocab_size) for i=1:length(words) ] # using BitArrays
+		sentence = [ falses(1, vocab_size) for i=1:length(words)+2 ] # using BitArrays
 		
+		sentence[1][word2index["<s>"]] = 1
 		for k = 1:length(words)
 			sentence[k][word2index[words[k]]] = 1
 		end
+		sentence[end][word2index["</s>"]] = 1
 		
 		push!(data, sentence);
 		ids[index] = id;
@@ -148,11 +155,11 @@ function generateCaption(dirImage, w, state, vocab, nwords)
 	img = processImage(dirImage, zeros(Float32,224,224,3,1))
 	inputRNN = simpleConvNet(w,img)
 	
-	input = rnn(w, state, img)
+	input = rnn(w, state, inputRNN)
 	input = getStartWord(KnetArray{Float32}, vocab)
 	index = 1
 	for t in 1:nwords
-		ypred = rnn(w, state, input*w[13])
+		ypred = rnn(w, state, input*w[end])
 		input[index] = 0
         	index = sample(exp(logp(ypred)))
 		if(index2word[index]=="</s>")
@@ -243,7 +250,7 @@ function initweights(atype, hidden, input, vocab, winit)
     return map(k->convert(atype,k), w)
 end
 
-
+#=
 function xavier(a...)
     w = rand(a...)
      # The old implementation was not right for fully connected layers:
@@ -261,7 +268,7 @@ function xavier(a...)
     s = sqrt(2 / (fanin + fanout))
     w = 2s*w-s
 end
-
+=#
 
 function init_rnn_weights(hidden, vocab, embed)
     model = Array(Any, 2*length(hidden)+3)
@@ -328,13 +335,12 @@ function lstm(weight,bias,hidden,cell,input)
 end
 
 
-function rnn(w,s,x; start = 10)
-	input = x*w[end]
+function rnn(w,s,input; start = 10)
 	for i=1:2:length(s)
 		(s[i],s[i+1]) = lstm(w[start + i],w[start + i+1],s[i],s[i+1],input)
 		input = s[i]
 	end
-	return s[end-2]*w[s] .+ w[end-1]
+	return input*w[end-2] .+ w[end-1]
 end
 
 
