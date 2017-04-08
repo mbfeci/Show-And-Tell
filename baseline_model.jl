@@ -28,7 +28,7 @@ function main(args=ARGS)
         ("--gclip"; arg_type=Float64; default=3.0; help="Value to clip the gradient norm at.")
         ("--winit"; arg_type=Float64; default=0.1; help="Initial weights set to winit*randn().")
         ("--gcheck"; arg_type=Int; default=0; help="Check N random gradients.")
-        ("--atype"; default=(gpu()>=0 ? "KnetArray{Float32}" : "Array{Float32}"); help="array type: Array for cpu, KnetArray for gpu")
+        ("--atype"; default=(gpu()>=0 ? KnetArray{Float32} : Array{Float32}); help="array type: Array for cpu, KnetArray for gpu")
     end
 	
 	o = parse_args(s; as_symbols=true)
