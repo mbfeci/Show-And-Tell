@@ -3,7 +3,15 @@ for p in ("Knet","Images","ArgParse","ImageMagick","MAT")#, "JLD")
     Pkg.installed(p) == nothing && Pkg.add(p)
 end
 
-using Knet, Images, ArgParse, MAT#, JLD
+using Knet, Images, ArgParse, MAT, JLD
+
+# To be able to load/save KnetArrays:
+if Pkg.installed("JLD") != nothing
+    import JLD: writeas, readas
+    type KnetJLD; a::Array; end
+    writeas(c::KnetArray) = KnetJLD(Array(c))
+    readas(d::KnetJLD) = KnetArray(d.a)
+end
 
 include("parser.jl");
 
@@ -23,7 +31,7 @@ function main(args=ARGS)
 		("--model"; default=Knet.dir("data","imagenet-vgg-verydeep-16.mat"); help="Location of the model file")
         ("--generate"; arg_type=Int; default=100; help="If non-zero generate given number of characters.")
 		("--hidden"; nargs='*'; arg_type=Int; default=[512]; help="sizes of hidden layers of multilayer LSTM, e.g. --hidden 512 256 for a net with two LSTM layers.")
-        ("--epochs"; arg_type=Int; default=1; help="Number of epochs for training.")
+        ("--epochs"; arg_type=Int; default=20; help="Number of epochs for training.")
         ("--batchsize"; arg_type=Int; default=20; help="Number of sequences to train on in parallel.")
         ("--seqlength"; arg_type=Int; default=25; help="Number of steps to unroll the network for.")
 		("--embed"; arg_type=Int; default=512; help="Size of the embedded word vector.")
@@ -34,7 +42,8 @@ function main(args=ARGS)
         ("--gcheck"; arg_type=Int; default=0; help="Check N random gradients.")
 		("--fast"; action=:store_true; help="skip loss printing for faster run")
         ("--atype"; default=(gpu()>=0 ? KnetArray{Float32} : Array{Float32}); help="array type: Array for cpu, KnetArray for gpu")
-    end
+		("--savefile"; default="./model/nic.jld" ;help="Save final model to file")
+	end
 	
 	o = parse_args(s; as_symbols=true)
 	
@@ -68,23 +77,25 @@ function main(args=ARGS)
     vgg_params = get_params(vgg)
     global convnet = get_convnet(vgg_params...)
 	global averageImage = convert(Array{Float32},vgg["meta"]["normalization"]["averageImage"])
-	
+
 
 	dict, word2index = parse_file(caption_file);
 	info("Dictionary and vocabulary are created");
 	info("The size of vocabulary is $(length(word2index))");
 	w = initweights(o[:atype], o[:hidden], o[:embed], length(word2index) , o[:winit]);
-
+	
     state = initstate(o[:atype],o[:hidden],o[:batchsize])
 	
 	ids, data = minibatch(dict, word2index, o[:batchsize]);
 
-	dicts = 0
+	dict = 0
 	Knet.knetgc(); gc();
 	#Execute only once:
 	#save_vgg_outputs(convnet, ids, data, o[:batchsize])
+	opts = init_params(w)
 	
-	train(w, state, ids, data, word2index, o)
+	println("Training is starting...")
+	train(w, state, ids, data, word2index, o, opts)
 
 	#Caption of that particular image:
 	if o[:generate] > 0
@@ -109,8 +120,8 @@ function loss(w,s,cout,sequence,range=1:length(sequence)-1)
 		count += size(sequence[t],1)
     end
 	
-	prediction = rnn(w,s,getEndWord(size(sequence[1],1),size(sequence[1],2))*w[end])
-	total += sum(sequence[end].*logp(prediction, 2))
+	prediction = rnn(w,s,sequence[end]*w[end])
+	total += sum(getEndWord(size(sequence[1],1),size(sequence[1],2)).*logp(prediction, 2))
 	count += size(sequence[end],1)
 	
     return -total / count
@@ -118,12 +129,21 @@ end
 
 lossgradient = grad(loss);
 
-function train(w, state, ids, sequence, word2index, o; cnnout = 4096)
+function train(w, state, ids, sequence, word2index, o, opts; cnnout = 4096)
 	lr = o[:lr]
 	prev_id = 0
 	
 	for epoch = 1:o[:epochs]
 		for index in 1:length(sequence)
+			#=
+			if index%300==0
+					new_state = initstate(o[:atype],o[:hidden],1)
+					println("Generating caption: ")
+					generateCaption(o[:image], w, new_state, word2index, o[:generate])
+			end
+			=#
+			length(sequence[index])>20 && continue;
+			#println("Length of the sentence is: ", length(sequence[index]))
 			cout = Array(Float32, o[:batchsize], cnnout)
 			for batchno in 1:o[:batchsize]
 				id = ids[batchno,index]
@@ -139,25 +159,18 @@ function train(w, state, ids, sequence, word2index, o; cnnout = 4096)
 			
 			cout = convert(o[:atype], cout)
 			sentence = map(k->convert(o[:atype], k),sequence[index])
-			
 			gloss = lossgradient(w,copy(state),cout,sentence)
 			
-			for j in 1:length(w)
-				update!(w[j], gloss[j]; lr=lr)
-			end
+			update!(w, gloss, opts)
 			
 			if index%100==0
 				@printf("%d is trained %0.3f%% of epoch is completed.\n",index, index/length(sequence)*100)
 				println("$(Knet.gpufree()) GPU memory left");
 				println("loss in this sentence is: ", loss(w,copy(state),cout,sentence))
+				Knet.knetgc(); gc();
 			end
-			
 		end
-		
-		if epochs % 5 == 0
-			lr *= o[:decay]
-		end
-		
+		save(o[:savefile],"model", w, "vocab", word2index, "epochs", epoch)
 	end
 end
 
@@ -209,6 +222,13 @@ function save_vgg_outputs(convnet,ids,data,batchsize)
 	println("DONE!");
 end
 
+function init_params(model)
+	prms = Array(Any, length(model))
+	for i in 1:length(model)
+		prms[i] = Adam()
+	end
+	return prms
+end
 
 function minibatch(dict, word2index, batchsize)
 	vocab_size = length(word2index)
@@ -246,25 +266,25 @@ function minibatch(dict, word2index, batchsize)
 		count += 1
 		index += batchsize
 	end
-	
+	shuffle!(data)
 	info("Minibatch completed with $count batches of size $batchsize")
 	return ids, data
 end
 
-function generateCaption(dirImage, w, state, vocab, nwords)
-	index2word = Array(String, length(vocab));
-    	for (k,v) in vocab; index2word[v] = k; end
+function generateCaption(dirImage, w, state, word2index, nwords)
+	index2word = Array(String, length(word2index));
+    	for (k,v) in word2index; index2word[v] = k; end
 	
 	img = processImage(dirImage, averageImage)
 	inputRNN = convnet(img)*w[1]
 	
 	input = rnn(w, state, inputRNN)
-	input = getStartWord(KnetArray{Float32}, vocab)
+	input = getStartWord(1, length(word2index))
 	index = 1
 	for t in 1:nwords
 		ypred = rnn(w, state, input*w[end])
 		input[index] = 0
-        	index = sample(exp(logp(ypred)))
+        index = sample(exp(logp(ypred)))
 		if(index2word[index]=="</s>")
 			println(".")
 			return;
@@ -503,6 +523,7 @@ fcx(x,w) = w[1] * mat(x) .+ w[2]
 tofunc(op) = eval(parse(string(op, "x")))
 forw(x,op) = tofunc(op)(x)
 forw(x,op,w) = tofunc(op)(x,w)
+
 
 
 main()
