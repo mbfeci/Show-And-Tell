@@ -1,13 +1,16 @@
-for p in ("Knet","Images","ArgParse")
+
+for p in ("Knet","Images","ArgParse","ImageMagick","MAT", "JLD")
     Pkg.installed(p) == nothing && Pkg.add(p)
 end
 
-using Knet, Images, ArgParse
+using Knet, Images, ArgParse, MAT, JLD
 
 include("parser.jl");
 
 const imgurl = "https://github.com/BVLC/caffe/raw/master/examples/images/cat.jpg"
-const caption_files = ["data/Flickr30kText/results_20130124.token"];
+const vggurl = "http://www.vlfeat.org/matconvnet/models/imagenet-vgg-verydeep-16.mat"
+const caption_files = ["data/Flickr30k/Flickr30kText/results_20130124.token"];
+const LAYER_TYPES = ["conv", "relu", "pool", "fc", "prob"]
 
 function main(args=ARGS)
 	
@@ -17,10 +20,11 @@ function main(args=ARGS)
     @add_arg_table s begin
 		("image"; default=imgurl; help="Image file or URL.")
 		("--datafiles"; nargs='+'; help="If provided, use first file for training, second for dev, others for test.")
+		("--model"; default=Knet.dir("data","imagenet-vgg-verydeep-16.mat"); help="Location of the model file")
         ("--generate"; arg_type=Int; default=100; help="If non-zero generate given number of characters.")
-		("--hidden"; nargs='*'; arg_type=Int; help="sizes of hidden layers of multilayer LSTM, e.g. --hidden 512 256 for a net with two LSTM layers.")
-        ("--epochs"; arg_type=Int; default=3; help="Number of epochs for training.")
-        ("--batchsize"; arg_type=Int; default=1; help="Number of sequences to train on in parallel.")
+		("--hidden"; nargs='*'; arg_type=Int; default=[512]; help="sizes of hidden layers of multilayer LSTM, e.g. --hidden 512 256 for a net with two LSTM layers.")
+        ("--epochs"; arg_type=Int; default=1; help="Number of epochs for training.")
+        ("--batchsize"; arg_type=Int; default=20; help="Number of sequences to train on in parallel.")
         ("--seqlength"; arg_type=Int; default=25; help="Number of steps to unroll the network for.")
 		("--embed"; arg_type=Int; default=512; help="Size of the embedded word vector.")
         ("--decay"; arg_type=Float64; default=0.5; help="Learning rate decay.")
@@ -28,6 +32,7 @@ function main(args=ARGS)
         ("--gclip"; arg_type=Float64; default=3.0; help="Value to clip the gradient norm at.")
         ("--winit"; arg_type=Float64; default=0.1; help="Initial weights set to winit*randn().")
         ("--gcheck"; arg_type=Int; default=0; help="Check N random gradients.")
+		("--fast"; action=:store_true; help="skip loss printing for faster run")
         ("--atype"; default=(gpu()>=0 ? KnetArray{Float32} : Array{Float32}); help="array type: Array for cpu, KnetArray for gpu")
     end
 	
@@ -35,10 +40,11 @@ function main(args=ARGS)
 	
 	#=
 	o = Dict();
+	o[:model] = Knet.dir("data","imagenet-vgg-verydeep-16.mat")
 	o[:atype] = KnetArray{Float32};
 	o[:hidden] = [512];
 	o[:embed] = 512;
-	o[:batchsize] = 1;
+	o[:batchsize] = 20;
 	o[:lr] = 0.1;
 	o[:decay] = 0.5;
 	o[:winit] = 0.1;
@@ -46,32 +52,56 @@ function main(args=ARGS)
 	o[:generate] = 100;
 	o[:image] = imgurl
 	o[:gclip] = 3.0
+	o[:fast] = false
 	=#
 	
+	println("opts=",[(k,v) for (k,v) in o]...)
+	
+	if !isfile(o[:model])
+        println("Should I download the VGG model (492MB)? Enter 'y' to download, anything else to quit.")
+        readline() == "y\n" || return
+        download(vggurl,o[:model])
+    end
+	
+	info("Reading $(o[:model])")
+    vgg = matread(o[:model])
+    vgg_params = get_params(vgg)
+    global convnet = get_convnet(vgg_params...)
+	global averageImage = convert(Array{Float32},vgg["meta"]["normalization"]["averageImage"])
+
+
 	dicts, word2index = parse_files(caption_files);
-	println("Dictionary and vocabulary are created, the size of vocabulary is ", length(word2index));
+	info("Dictionary and vocabulary are created");
+	info("The size of vocabulary is $(length(word2index))");
 	w = initweights(o[:atype], o[:hidden], o[:embed], length(word2index) , o[:winit]);
 
     state = initstate(o[:atype],o[:hidden],o[:batchsize])
 	
-	ids, data = prepare_data(dicts[1], word2index);
+	ids, data = minibatch(dicts[1], word2index, o[:batchsize]);
 
-	train(w, ids, data, word2index, o)
+	dicts = 0
+	Knet.knetgc(); gc();
+	#Execute only once:
+	save_vgg_outputs(convnet, ids, data, o[:batchsize])
 	
+	train(w, state, ids, data, word2index, o)
+
 	#Caption of that particular image:
 	if o[:generate] > 0
-		new_state = initstate(o[:atype],o[:hidden],o[:batchsize])
+		new_state = initstate(o[:atype],o[:hidden],1)
 		generateCaption(o[:image], w, new_state, word2index, o[:generate])
 	end
+
 end
 
 #Assuming seq is: [word1 word2 word3 ...]
-function loss(w,s,img,sequence,range=1:length(sequence)-1)
+function loss(w,s,cout,sequence,range=1:length(sequence)-1)
     total = 0.0; count = 0
 	
-	#Do we want to train CNN as well?
-	encoded_image = simpleConvNet(w,img)
-	rnn(w,s,encoded_image);
+	rnn(w,s,cout*w[1]);
+	
+	prediction = rnn(w,s,getStartWord(size(sequence[1],1),size(sequence[1],2))*w[end])
+	total += sum(sequence[1].*logp(prediction, 2))
 	
     for t in range
 		prediction = rnn(w,s,sequence[t]*w[end])
@@ -79,47 +109,59 @@ function loss(w,s,img,sequence,range=1:length(sequence)-1)
 		count += size(sequence[t],1)
     end
 	
+	prediction = rnn(w,s,getEndWord(size(sequence[1],1),size(sequence[1],2))*w[end])
+	total += sum(sequence[end].*logp(prediction, 2))
+	count += size(sequence[end],1)
+	
     return -total / count
 end
 
-
 lossgradient = grad(loss);
 
-function train(w, ids, sequence, word2index, o)
-	state = initstate(o[:atype],o[:hidden],o[:batchsize])
+function train(w, state, ids, sequence, word2index, o; cnnout = 4096)
 	lr = o[:lr]
 	prev_id = 0
-	img = 0
+	
 	for epoch = 1:o[:epochs]
-		count = 1
-		for id in ids
-			if prev_id!=id
-				imageloc = "data/flickr30k-images/$id.jpg";
-				img = processImage(imageloc, zeros(Float32,224,224,3,1))
+		for index in 1:length(sequence)
+			cout = Array(Float32, o[:batchsize], cnnout)
+			for batchno in 1:o[:batchsize]
+				id = ids[batchno,index]
+				feature_directory = "./data/Flickr30k/VGG/features/$(id).jld"
+				if isfile(feature_directory)
+					cout[batchno, :] = load(feature_directory, "feature")
+				else
+					imageloc = "data/Flickr30k/flickr30k-images/$id.jpg";
+					cout[batchno, :] = convert(Array{Float32}, convnet(processImage(imageloc, averageImage)))
+					save(feature_directory, "feature", cout[batchno,:])
+				end
 			end
 			
-			sentence = map(k->convert(o[:atype], k),sequence[count])
-				
-			gloss = lossgradient(w,copy(state),img,sentence)
-				
+			cout = convert(o[:atype], cout)
+			sentence = map(k->convert(o[:atype], k),sequence[index])
+			
+			gloss = lossgradient(w,copy(state),cout,sentence)
+			
 			for j in 1:length(w)
 				update!(w[j], gloss[j]; lr=lr)
 			end
-
-			println(Knet.gpufree())
-			count = count + 1
-			count%4==0 && println("$id is finished.");
-			prev_id = id
+			
+			if index%100==0
+				@printf("%d is trained %0.3f%% of epoch is completed.\n",index, index/length(sequence)*100)
+				println("$(Knet.gpufree()) GPU memory left");
+				println("loss in this sentence is: ", loss(w,copy(state),cout,sentence))
+			end
+			
 		end
 		
 		if epochs % 5 == 0
 			lr *= o[:decay]
 		end
+		
 	end
-	
 end
 
-
+#=
 function prepare_data(dict, word2index)
 	vocab_size = length(word2index)
 	ids = Array(Int64, 5*length(dict));
@@ -145,15 +187,76 @@ function prepare_data(dict, word2index)
 	
 	return ids, data
 end
+=#
+
+function save_vgg_outputs(convnet,ids,data,batchsize)
+	
+	for index in 1:length(data)
+		for batchno in 1:batchsize
+			id = ids[batchno,index]
+			filename = "./data/Flickr30k/VGG/features/$id.jld";
+			
+			if !isfile(filename)
+				imageloc = "data/Flickr30k/flickr30k-images/$id.jpg";
+				img = processImage(imageloc, averageImage)
+				cout = convert(Array{Float32},convnet(img))
+				save(filename,"feature",cout)
+			end
+		end
+		
+		println("The batch with no ", index, " is successfully saved");
+	end
+	println("DONE!");
+end
 
 
+function minibatch(dict, word2index, batchsize)
+	vocab_size = length(word2index)
+	
+	ids = Array(Int64, batchsize, div(length(dict),batchsize)); #An upperbound for the size of the ids
+	data = Array{Any,1}()
+	index = 1
+	count = 1
+	while true
+		index>length(dict)-batchsize+1 && break
+		
+		seq = dict[index];
+		id = seq[1];
+		len = seq[2];
+		words = seq[3];
+		if dict[index+batchsize-1][2] != len
+			index += 1;
+			continue;
+		end
+		
+		sentence = [ falses(batchsize, vocab_size) for j=1:length(words) ] # using BitArrays
+		for i in index:index+batchsize-1
+			seq = dict[i];
+			id = seq[1];
+			len = seq[2];
+			words = seq[3];
+			for k = 1:len
+				sentence[k][i-index+1,word2index[words[k]]] = 1
+			end
+			
+			ids[i-index+1,count] = id;
+		end
+		push!(data, sentence);
+
+		count += 1
+		index += batchsize
+	end
+	
+	info("Minibatch completed with $count batches of size $batchsize")
+	return ids, data
+end
 
 function generateCaption(dirImage, w, state, vocab, nwords)
 	index2word = Array(String, length(vocab));
     	for (k,v) in vocab; index2word[v] = k; end
 	
-	img = processImage(dirImage, zeros(Float32,224,224,3,1))
-	inputRNN = simpleConvNet(w,img)
+	img = processImage(dirImage, averageImage)
+	inputRNN = convnet(img)*w[1]
 	
 	input = rnn(w, state, inputRNN)
 	input = getStartWord(KnetArray{Float32}, vocab)
@@ -163,7 +266,7 @@ function generateCaption(dirImage, w, state, vocab, nwords)
 		input[index] = 0
         	index = sample(exp(logp(ypred)))
 		if(index2word[index]=="</s>")
-			println()
+			println(".")
 			return;
 		end
 		print(index2word[index], " ")
@@ -202,19 +305,17 @@ function processImage(img, averageImage)
 end
 
 
-
-
-function getStartWord(atype, vocab)
-	x = zeros(Float32, 1,length(vocab))
-	x[vocab["<s>"]] = 1
+function getStartWord(batchsize, vocabsize; atype = KnetArray{Float32})
+	x = zeros(Float32, batchsize,vocabsize)
+	x[:,1] = 1
 	x = convert(atype, x)
 	return x
 end
 
 
-function getEndWord(atype, vocab)
-	x = zeros(Float32, 1,length(vocab))
-	x[vocab["</s>"]] = 1
+function getEndWord(batchsize, vocabsize; atype = KnetArray{Float32})
+	x = zeros(Float32, batchsize,vocabsize)
+	x[:,2] = 1
 	x = convert(atype, x)
 	return x
 end
@@ -244,11 +345,14 @@ function oneHotVector(atype, s, vocab)
 end
 
 
-function initweights(atype, hidden, input, vocab, winit)
-	w = init_cnn_weights(winit, input);
-	append!(w, init_rnn_weights(hidden, vocab, input))
+function initweights(atype, hidden, input, vocab, winit, cout=4096)
+	#w = init_cnn_weights(winit, input);
+	w = [xavier(cout,input)];
+	append!(w,init_rnn_weights(hidden, vocab, input))
+	#append!(w, init_rnn_weights(hidden, vocab, input))
     return map(k->convert(atype,k), w)
 end
+
 
 #=
 function xavier(a...)
@@ -287,7 +391,7 @@ function init_rnn_weights(hidden, vocab, embed)
     return model
 end
 
-
+#=
 function init_cnn_weights(winit, embed)
 
 	#=VGG ConvNet parameters
@@ -298,8 +402,6 @@ function init_cnn_weights(winit, embed)
 	-0.1 + winit*rand(Float32,3,3,256,512), zeros(Float32,1,1,512,1),
 	-0.1 + winit*rand(Float32,3,3,512,512), zeros(Float32,1,1,512,1)]
 	=#
-
-	
 	#For baseline model, a simple ConvNet is used.
 	w = Any[ -0.1+winit*rand(Float32, 5,5,3,10),  zeros(Float32,1,1,10,1),
 	-0.1 + winit*rand(Float32,5,5,10,10), zeros(Float32,1,1,10,1),
@@ -309,18 +411,19 @@ function init_cnn_weights(winit, embed)
 
 	return w
 end
+=#
 
+#=
 #Input size is 224x224x3x1
 function simpleConvNet(w, x)
 	x1 = pool(relu(conv4(w[1], x; stride = 1, padding = 2).+w[2]);window = 2, stride = 2)
 	x2 = pool(relu(conv4(w[3], x1; stride = 1, padding = 2).+w[4]);window = 2, stride = 2)
 	x3 = pool(relu(conv4(w[5], x2; stride = 1, padding = 2).+w[6]);window = 2, stride = 2)
 	x4 = pool(relu(conv4(w[7], x3; stride = 1, padding = 2).+w[8]);window = 2, stride = 2)
-	
-	
-	return mat(x4)'*w[9] + w[10];
-end
 
+	return mat(x4)'*w[9] .+ w[10];
+end
+=#
 
 function lstm(weight,bias,hidden,cell,input)
     gates   = hcat(input,hidden) * weight .+ bias
@@ -335,13 +438,71 @@ function lstm(weight,bias,hidden,cell,input)
 end
 
 
-function rnn(w,s,input; start = 10)
+function rnn(w,s,input; start = 1)
 	for i=1:2:length(s)
 		(s[i],s[i+1]) = lstm(w[start + i],w[start + i+1],s[i],s[i+1],input)
 		input = s[i]
 	end
 	return input*w[end-2] .+ w[end-1]
 end
+
+
+# This procedure makes pretrained MatConvNet VGG parameters convenient for Knet
+# Also, if you want to extract features, specify the last layer you want to use
+function get_params(CNN; last_layer="fc7")
+    layers = CNN["layers"]
+    weights, operations, derivatives = [], [], []
+
+    for l in layers
+        get_layer_type(x) = startswith(l["name"], x)
+        operation = filter(x -> get_layer_type(x), LAYER_TYPES)[1]
+        push!(operations, operation)
+        push!(derivatives, haskey(l, "weights") && length(l["weights"]) != 0)
+
+        if derivatives[end]
+            w = l["weights"]
+            if operation == "conv"
+                w[2] = reshape(w[2], (1,1,length(w[2]),1))
+            elseif operation == "fc"
+                w[1] = transpose(mat(w[1]))
+            end
+            push!(weights, w)
+        end
+
+        last_layer != nothing && get_layer_type(last_layer) && break
+    end
+
+    map(w -> map(KnetArray, w), weights), operations, derivatives
+end
+
+# get convolutional network by interpreting parameters
+function get_convnet(weights, operations, derivatives)
+    function convnet(xs)
+        i, j = 1, 1
+        num_weights, num_operations = length(weights), length(operations)
+        while i <= num_operations && j <= num_weights
+            if derivatives[i]
+                xs = forw(xs, operations[i], weights[j])
+                j += 1
+            else
+                xs = forw(xs, operations[i])
+            end
+
+            i += 1
+        end
+        return xs'
+    end
+end
+
+# convolutional network operations
+convx(x,w) = conv4(w[1], x; padding=1, mode=1) .+ w[2]
+relux = relu
+poolx = pool
+probx(x) = x
+fcx(x,w) = w[1] * mat(x) .+ w[2]
+tofunc(op) = eval(parse(string(op, "x")))
+forw(x,op) = tofunc(op)(x)
+forw(x,op,w) = tofunc(op)(x,w)
 
 
 main()
