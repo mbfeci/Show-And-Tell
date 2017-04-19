@@ -56,7 +56,7 @@ function main(args=ARGS)
 	=#
 	
 	println("opts=",[(k,v) for (k,v) in o]...)
-	#=
+	
 	if !isfile(o[:model])
         println("Should I download the VGG model (492MB)? Enter 'y' to download, anything else to quit.")
         readline() == "y\n" || return
@@ -68,7 +68,7 @@ function main(args=ARGS)
     vgg_params = get_params(vgg)
     global convnet = get_convnet(vgg_params...)
 	global averageImage = convert(Array{Float32},vgg["meta"]["normalization"]["averageImage"])
-	=#
+	
 
 	dict, word2index = parse_file(caption_file);
 	info("Dictionary and vocabulary are created");
@@ -82,7 +82,7 @@ function main(args=ARGS)
 	dicts = 0
 	Knet.knetgc(); gc();
 	#Execute only once:
-	save_vgg_outputs(convnet, ids, data, o[:batchsize])
+	#save_vgg_outputs(convnet, ids, data, o[:batchsize])
 	
 	train(w, state, ids, data, word2index, o)
 
