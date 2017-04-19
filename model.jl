@@ -1,15 +1,15 @@
 
-for p in ("Knet","Images","ArgParse","ImageMagick","MAT", "JLD")
+for p in ("Knet","Images","ArgParse","ImageMagick","MAT")#, "JLD")
     Pkg.installed(p) == nothing && Pkg.add(p)
 end
 
-using Knet, Images, ArgParse, MAT, JLD
+using Knet, Images, ArgParse, MAT#, JLD
 
 include("parser.jl");
 
 const imgurl = "https://github.com/BVLC/caffe/raw/master/examples/images/cat.jpg"
 const vggurl = "http://www.vlfeat.org/matconvnet/models/imagenet-vgg-verydeep-16.mat"
-const caption_files = ["data/Flickr30k/Flickr30kText/results_20130124.token"];
+const caption_file = "data/Flickr30k/Flickr30kText/results_20130124.token";
 const LAYER_TYPES = ["conv", "relu", "pool", "fc", "prob"]
 
 function main(args=ARGS)
@@ -56,7 +56,7 @@ function main(args=ARGS)
 	=#
 	
 	println("opts=",[(k,v) for (k,v) in o]...)
-	
+	#=
 	if !isfile(o[:model])
         println("Should I download the VGG model (492MB)? Enter 'y' to download, anything else to quit.")
         readline() == "y\n" || return
@@ -68,16 +68,16 @@ function main(args=ARGS)
     vgg_params = get_params(vgg)
     global convnet = get_convnet(vgg_params...)
 	global averageImage = convert(Array{Float32},vgg["meta"]["normalization"]["averageImage"])
+	=#
 
-
-	dicts, word2index = parse_files(caption_files);
+	dict, word2index = parse_file(caption_file);
 	info("Dictionary and vocabulary are created");
 	info("The size of vocabulary is $(length(word2index))");
 	w = initweights(o[:atype], o[:hidden], o[:embed], length(word2index) , o[:winit]);
 
     state = initstate(o[:atype],o[:hidden],o[:batchsize])
 	
-	ids, data = minibatch(dicts[1], word2index, o[:batchsize]);
+	ids, data = minibatch(dict, word2index, o[:batchsize]);
 
 	dicts = 0
 	Knet.knetgc(); gc();
