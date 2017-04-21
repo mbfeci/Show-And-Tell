@@ -12,8 +12,8 @@ function parse_flickr30k(lines)
 	dict = Array{Tuple{Int64, Int64, Array{String, 1}},1}();  # (id, (#no, Sentence))
 	for i = 1 : length(lines)
 		tokens = map(lowercase, split(lines[i],['.','#','\t',' ', '\n']))
-		filter!(t->length(t)>0,tokens);
-		push!(dict, (parse(Int64, tokens[1]), length(tokens)-3, tokens[4:end])) 
+		filter!(t->length(t)>0, tokens);
+		push!(dict, (parse(Int64, tokens[1]), length(tokens)-3, map(t->strip(t,[' ', '.', ',','#', '\'', ')', '(', '!', '/', '?', '\t', '`']),tokens[4:end]))) 
 	end
 	sort!(dict; by = t->t[2])
 	return dict
