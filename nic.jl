@@ -27,12 +27,16 @@ function main(args=ARGS)
     # s.exc_handler=ArgParse.debug_handler
     @add_arg_table s begin
 		("image"; default=imgurl; help="Image file or URL.")
+		("--imgid"; arg_type=Int; default=6734417; help="id of the image to be captioned")
+		("--notrain"; action=:store_true; help="skip training")
+		("--transfer"; action=:store_true; help="transfer learning.")
+		("--bestmodel"; default = "./model/nic.jld"; help="The location of the parameters of the best model")
 		("--datafiles"; nargs='+'; help="If provided, use first file for training, second for dev, others for test.")
 		("--model"; default=Knet.dir("data","imagenet-vgg-verydeep-16.mat"); help="Location of the model file")
         ("--generate"; arg_type=Int; default=100; help="If non-zero generate given number of characters.")
 		("--hidden"; nargs='*'; arg_type=Int; default=[512]; help="sizes of hidden layers of multilayer LSTM, e.g. --hidden 512 256 for a net with two LSTM layers.")
         ("--epochs"; arg_type=Int; default=20; help="Number of epochs for training.")
-        ("--batchsize"; arg_type=Int; default=20; help="Number of sequences to train on in parallel.")
+        ("--batchsize"; arg_type=Int; default=50; help="Number of sequences to train on in parallel.")
         ("--seqlength"; arg_type=Int; default=25; help="Number of steps to unroll the network for.")
 		("--embed"; arg_type=Int; default=512; help="Size of the embedded word vector.")
         ("--decay"; arg_type=Float64; default=0.5; help="Learning rate decay.")
@@ -53,7 +57,7 @@ function main(args=ARGS)
 	o[:atype] = KnetArray{Float32};
 	o[:hidden] = [512];
 	o[:embed] = 512;
-	o[:batchsize] = 20;
+	o[:batchsize] = 50;
 	o[:lr] = 0.1;
 	o[:decay] = 0.5;
 	o[:winit] = 0.1;
@@ -78,8 +82,9 @@ function main(args=ARGS)
     global convnet = get_convnet(vgg_params...)
 	global averageImage = convert(Array{Float32},vgg["meta"]["normalization"]["averageImage"])
 
-
-	dict, word2index = parse_file(caption_file);
+	
+	dict, vocab = parse_file(caption_file);
+	global word2index = vocab
 	info("Dictionary and vocabulary are created");
 	info("The size of vocabulary is $(length(word2index))");
 	w = initweights(o[:atype], o[:hidden], o[:embed], length(word2index) , o[:winit]);
@@ -94,17 +99,25 @@ function main(args=ARGS)
 	#save_vgg_outputs(convnet, ids, data, o[:batchsize])
 	opts = init_params(w)
 	
-	println("Training is starting...")
-	train(w, state, ids, data, word2index, o, opts)
+	#println("Training is starting...")
+	
+	if o[:transfer] && o[:bestmodel] != nothing
+		info("Loading best model...")
+		w = load(o[:bestmodel], "model")
+	end
+
+	!o[:notrain] && train(w, state, ids, data, word2index, o, opts)
 
 	#Caption of that particular image:
 	if o[:generate] > 0
 		new_state = initstate(o[:atype],o[:hidden],1)
-		generateCaption(o[:image], w, new_state, word2index, o[:generate])
+		generate_caption(o[:image], w, copy(new_state), word2index, o[:generate])
+		println("Generating caption of the image with id: $(o[:imgid])")
+		generate_caption_from_dataset(o[:imgid], w, copy(new_state), word2index, o[:generate])
 	end
 
 end
-
+#=
 #Assuming seq is: [word1 word2 word3 ...]
 function loss(w,s,cout,sequence,range=1:length(sequence)-1)
     total = 0.0; count = 0
@@ -126,6 +139,50 @@ function loss(w,s,cout,sequence,range=1:length(sequence)-1)
 	
     return -total / count
 end
+=#
+
+function loss(w,s,cout,sequence,range=1:length(sequence)-1)
+    total = 0.0; count = 0
+	
+	rnn(w,s,cout*w[1]);
+	batchsize = length(sequence[1])
+	vocabsize = length(word2index)
+	
+	prediction = rnn(w,s,w[end][ones(batchsize),:])
+	
+	golds = sequence[1]
+	#index = similar(golds)
+	ynorm = logp(prediction,2)
+	@inbounds for i=1:batchsize
+		#index[i] = i + (golds[i]-1)*batchsize
+		total += ynorm[i,golds[i]]
+	end
+	
+	#total += sum(logp(prediction, 2)[index])
+	count += batchsize
+	
+    for t in range
+		prediction = rnn(w,s,w[end][sequence[t],:])
+		ynorm = logp(prediction,2)
+		
+		golds = sequence[t+1]
+
+		@inbounds for i=1:batchsize
+			#index[i] = i + (golds[i]-1)*batchsize
+			total += ynorm[i,golds[i]]
+		end
+		
+		#total += sum(logp(prediction, 2)[index])
+		count += batchsize
+    end
+	
+	prediction = rnn(w,s,w[end][sequence[end],:])
+	
+	total += sum(logp(prediction, 2)[:,2])
+	count += batchsize
+	
+    return -total / count
+end
 
 lossgradient = grad(loss);
 
@@ -134,14 +191,15 @@ function train(w, state, ids, sequence, word2index, o, opts; cnnout = 4096)
 	prev_id = 0
 	
 	for epoch = 1:o[:epochs]
+		println("Starting ", epoch,". epoch...")
 		for index in 1:length(sequence)
-			#=
-			if index%300==0
-					new_state = initstate(o[:atype],o[:hidden],1)
-					println("Generating caption: ")
-					generateCaption(o[:image], w, new_state, word2index, o[:generate])
+			if index%100==1
+				new_state = initstate(o[:atype],o[:hidden],1)
+				id_gen = ids[rand(1:o[:batchsize]),rand(1:1000)]
+				println("Generating caption for $(id_gen): ")
+				generate_caption_from_dataset(id_gen, w, new_state, word2index, o[:generate])
+				Knet.knetgc(); gc();
 			end
-			=#
 			length(sequence[index])>20 && continue;
 			#println("Length of the sentence is: ", length(sequence[index]))
 			cout = Array(Float32, o[:batchsize], cnnout)
@@ -156,21 +214,20 @@ function train(w, state, ids, sequence, word2index, o, opts; cnnout = 4096)
 					save(feature_directory, "feature", cout[batchno,:])
 				end
 			end
-			
+
 			cout = convert(o[:atype], cout)
-			sentence = map(k->convert(o[:atype], k),sequence[index])
+			sentence = sequence[index] #sentence = map(k->convert(o[:atype], k),sequence[index])
 			gloss = lossgradient(w,copy(state),cout,sentence)
 			
 			update!(w, gloss, opts)
-			
-			if index%100==0
+			if index%10 == 1
 				@printf("%d is trained %0.3f%% of epoch is completed.\n",index, index/length(sequence)*100)
 				println("$(Knet.gpufree()) GPU memory left");
 				println("loss in this sentence is: ", loss(w,copy(state),cout,sentence))
-				Knet.knetgc(); gc();
 			end
 		end
-		save(o[:savefile],"model", w, "vocab", word2index, "epochs", epoch)
+		println(epoch,". epoch is finished.")
+		#save(o[:savefile],"model", w, "vocab", word2index, "epochs", epoch)
 	end
 end
 
@@ -203,7 +260,6 @@ end
 =#
 
 function save_vgg_outputs(convnet,ids,data,batchsize)
-	
 	for index in 1:length(data)
 		for batchno in 1:batchsize
 			id = ids[batchno,index]
@@ -230,6 +286,7 @@ function init_params(model)
 	return prms
 end
 
+#=
 function minibatch(dict, word2index, batchsize)
 	vocab_size = length(word2index)
 	
@@ -237,6 +294,7 @@ function minibatch(dict, word2index, batchsize)
 	data = Array{Any,1}()
 	index = 1
 	count = 1
+	
 	while true
 		index>length(dict)-batchsize+1 && break
 		
@@ -270,8 +328,50 @@ function minibatch(dict, word2index, batchsize)
 	info("Minibatch completed with $count batches of size $batchsize")
 	return ids, data
 end
+=#
 
-function generateCaption(dirImage, w, state, word2index, nwords)
+function minibatch(dict, word2index, batchsize)
+	vocab_size = length(word2index)
+	
+	ids = Array(Int64, batchsize, div(length(dict),batchsize)); #An upperbound for the size of the ids
+	data = Array{Any,1}()
+	index = 1
+	count = 1
+	while true
+		index>length(dict)-batchsize+1 && break
+		
+		seq = dict[index];
+		id = seq[1];
+		len = seq[2];
+		words = seq[3];
+		if dict[index+batchsize-1][2] != len
+			index += 1;
+			continue;
+		end
+		
+		sentence = [ zeros(Int, batchsize) for j=1:length(words) ]
+		for i in index:index+batchsize-1
+			seq = dict[i];
+			id = seq[1];
+			len = seq[2];
+			words = seq[3];
+			for k = 1:len
+				sentence[k][i-index+1] = word2index[words[k]]
+			end
+			
+			ids[i-index+1,count] = id;
+		end
+		push!(data, sentence);
+		
+		count += 1
+		index += batchsize
+	end
+	shuffle!(data)
+	info("Minibatch completed with $count batches of size $batchsize")
+	return ids, data
+end
+
+function generate_caption(dirImage, w, state, word2index, nwords)
 	index2word = Array(String, length(word2index));
     	for (k,v) in word2index; index2word[v] = k; end
 	
@@ -286,12 +386,39 @@ function generateCaption(dirImage, w, state, word2index, nwords)
 		input[index] = 0
         index = sample(exp(logp(ypred)))
 		if(index2word[index]=="</s>")
-			println(".")
+			println();
 			return;
 		end
 		print(index2word[index], " ")
 		input[index] = 1
     end
+end
+
+function generate_caption_from_dataset(id, w, state, word2index, nwords)
+	index2word = Array(String, length(word2index));
+    	for (k,v) in word2index; index2word[v] = k; end
+	
+	filename = "./data/Flickr30k/VGG/features/$id.jld"
+	
+	!isfile(filename) && return;
+	
+	inputRNN = convert(KnetArray{Float32}, load(filename,"feature"))*w[1]
+	
+	input = rnn(w, state, inputRNN)
+	input = getStartWord(1, length(word2index))
+	index = 1
+	for t in 1:nwords
+		ypred = rnn(w, state, input*w[end])
+		input[index] = 0
+        index = sample(exp(logp(ypred)))
+		if(index2word[index]=="</s>")
+			println();
+			return;
+		end
+		print(index2word[index], " ")
+		input[index] = 1
+    end
+	println();
 end
 
 
