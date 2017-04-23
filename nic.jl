@@ -36,7 +36,7 @@ function main(args=ARGS)
         ("--generate"; arg_type=Int; default=100; help="If non-zero generate given number of characters.")
 		("--hidden"; nargs='*'; arg_type=Int; default=[512]; help="sizes of hidden layers of multilayer LSTM, e.g. --hidden 512 256 for a net with two LSTM layers.")
         ("--epochs"; arg_type=Int; default=20; help="Number of epochs for training.")
-        ("--batchsize"; arg_type=Int; default=50; help="Number of sequences to train on in parallel.")
+        ("--batchsize"; arg_type=Int; default=64; help="Number of sequences to train on in parallel.")
         ("--seqlength"; arg_type=Int; default=25; help="Number of steps to unroll the network for.")
 		("--embed"; arg_type=Int; default=512; help="Size of the embedded word vector.")
         ("--decay"; arg_type=Float64; default=0.5; help="Learning rate decay.")
@@ -76,6 +76,7 @@ function main(args=ARGS)
         download(vggurl,o[:model])
     end
 	
+
 	info("Reading $(o[:model])")
     vgg = matread(o[:model])
     vgg_params = get_params(vgg)
@@ -85,6 +86,11 @@ function main(args=ARGS)
 	
 	dict, vocab = parse_file(caption_file);
 	global word2index = vocab
+	
+	global	index2word = Array(String, length(word2index));
+    for (k,v) in word2index; index2word[v] = k; end
+	
+
 	info("Dictionary and vocabulary are created");
 	info("The size of vocabulary is $(length(word2index))");
 	w = initweights(o[:atype], o[:hidden], o[:embed], length(word2index) , o[:winit]);
@@ -93,10 +99,34 @@ function main(args=ARGS)
 	
 	ids, data = minibatch(dict, word2index, o[:batchsize]);
 
+	#=
+	info("Loading features to the memory...")
+	global features = Dict{Int64, KnetArray{Float32}}()
+	
+	count=0
+	for id in ids
+		if(!haskey(features,id))
+			get!(features, id, load("./data/Flickr30k/VGG/features/$id.jld", "feature"))
+			count += 1
+			if count%100==0
+				println(count)
+			end
+		end
+	end
+	
+	info("Features are loaded into memory.")
+	
+	save("./data/Flickr30k/VGG/features/feature_dict.jld", "feature_dict", features)
+	info("Feature dictionary is saved into jld file")
+	=#
+	
+	info("Loading features into memory...")
+	global features = load("./data/Flickr30k/VGG/features/feature_dict.jld", "feature_dict")
 	dict = 0
 	Knet.knetgc(); gc();
 	#Execute only once:
-	#save_vgg_outputs(convnet, ids, data, o[:batchsize])
+	save_vgg_outputs(convnet, ids, data, o[:batchsize])
+	
 	opts = init_params(w)
 	
 	#println("Training is starting...")
@@ -190,6 +220,8 @@ function train(w, state, ids, sequence, word2index, o, opts; cnnout = 4096)
 	lr = o[:lr]
 	prev_id = 0
 	
+	index2word = Array(String, length(word2index));
+    	for (k,v) in word2index; index2word[v] = k; end
 	for epoch = 1:o[:epochs]
 		println("Starting ", epoch,". epoch...")
 		for index in 1:length(sequence)
@@ -200,34 +232,56 @@ function train(w, state, ids, sequence, word2index, o, opts; cnnout = 4096)
 				generate_caption_from_dataset(id_gen, w, new_state, word2index, o[:generate])
 				Knet.knetgc(); gc();
 			end
-			length(sequence[index])>20 && continue;
+			
+			#length(sequence[index])>20 && continue;
 			#println("Length of the sentence is: ", length(sequence[index]))
-			cout = Array(Float32, o[:batchsize], cnnout)
+			
+			cout = convert(KnetArray, Array(Float32, o[:batchsize], cnnout))
+			
 			for batchno in 1:o[:batchsize]
 				id = ids[batchno,index]
+				#=
 				feature_directory = "./data/Flickr30k/VGG/features/$(id).jld"
+				
 				if isfile(feature_directory)
 					cout[batchno, :] = load(feature_directory, "feature")
 				else
 					imageloc = "data/Flickr30k/flickr30k-images/$id.jpg";
-					cout[batchno, :] = convert(Array{Float32}, convnet(processImage(imageloc, averageImage)))
+					cout[batchno, :] = convnet(processImage(imageloc, averageImage))
 					save(feature_directory, "feature", cout[batchno,:])
 				end
+				=#
+				cout[batchno, :] = features[id]
 			end
-
-			cout = convert(o[:atype], cout)
-			sentence = sequence[index] #sentence = map(k->convert(o[:atype], k),sequence[index])
-			gloss = lossgradient(w,copy(state),cout,sentence)
 			
+			
+			#cout = convert(o[:atype], cout)
+			sentence = sequence[index] #sentence = map(k->convert(o[:atype], k),sequence[index])
+
+			gloss = lossgradient(w,copy(state),cout,sentence)
+
 			update!(w, gloss, opts)
+
+			
 			if index%10 == 1
+				#To check whether the ids are correctly matched to the captions.
+				#=
+				rand_no = rand(1:o[:batchsize])
+				id_print = ids[rand_no,index]
+				println("ID: $(id_print)")
+				for word in sentence
+					print(index2word[word[rand_no]], " ")
+				end	
+				println()
+				=#
+
 				@printf("%d is trained %0.3f%% of epoch is completed.\n",index, index/length(sequence)*100)
 				println("$(Knet.gpufree()) GPU memory left");
 				println("loss in this sentence is: ", loss(w,copy(state),cout,sentence))
 			end
 		end
 		println(epoch,". epoch is finished.")
-		#save(o[:savefile],"model", w, "vocab", word2index, "epochs", epoch)
+		save(o[:savefile],"model 1 epoch $(epoch)", w, "vocab", word2index, "epochs", epoch)
 	end
 end
 
@@ -260,6 +314,7 @@ end
 =#
 
 function save_vgg_outputs(convnet,ids,data,batchsize)
+
 	for index in 1:length(data)
 		for batchno in 1:batchsize
 			id = ids[batchno,index]
@@ -268,12 +323,20 @@ function save_vgg_outputs(convnet,ids,data,batchsize)
 			if !isfile(filename)
 				imageloc = "data/Flickr30k/flickr30k-images/$id.jpg";
 				img = processImage(imageloc, averageImage)
-				cout = convert(Array{Float32},convnet(img))
+				cout = convnet(img)
 				save(filename,"feature",cout)
 			end
 		end
-		
-		println("The batch with no ", index, " is successfully saved");
+		if(index%100==1)
+			id = ids[1,index]
+			println("ID: $id")
+			sentence = data[index]
+			for word in sentence
+				print(index2word[word[1]], " ")
+			end	
+			println()
+		end
+		index%100==0 && println("The batch with no ", index, " is successfully saved");
 	end
 	println("DONE!");
 end
@@ -356,7 +419,7 @@ function minibatch(dict, word2index, batchsize)
 			len = seq[2];
 			words = seq[3];
 			for k = 1:len
-				sentence[k][i-index+1] = word2index[words[k]]
+				sentence[k][i-index+1] = get(word2index,words[k],3)
 			end
 			
 			ids[i-index+1,count] = id;
@@ -366,7 +429,10 @@ function minibatch(dict, word2index, batchsize)
 		count += 1
 		index += batchsize
 	end
-	shuffle!(data)
+	#shuffle!(data)
+	order = randperm(length(data))
+	data = data[order];
+	ids = ids[:,order]
 	info("Minibatch completed with $count batches of size $batchsize")
 	return ids, data
 end
