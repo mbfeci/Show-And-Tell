@@ -27,15 +27,16 @@ function main(args=ARGS)
     # s.exc_handler=ArgParse.debug_handler
     @add_arg_table s begin
 		("image"; default=imgurl; help="Image file or URL.")
+		("--cnnout"; default = 4096; help="Length of the image feature vectors")
 		("--imgid"; arg_type=Int; default=6734417; help="id of the image to be captioned")
 		("--notrain"; action=:store_true; help="skip training")
 		("--transfer"; action=:store_true; help="transfer learning.")
-		("--bestmodel"; default = "./model/nic.jld"; help="The location of the parameters of the best model")
+		("--bestmodel"; default = "./model/nic3.jld"; help="The location of the parameters of the best model")
 		("--datafiles"; nargs='+'; help="If provided, use first file for training, second for dev, others for test.")
 		("--model"; default=Knet.dir("data","imagenet-vgg-verydeep-16.mat"); help="Location of the model file")
         ("--generate"; arg_type=Int; default=100; help="If non-zero generate given number of characters.")
 		("--hidden"; nargs='*'; arg_type=Int; default=[512]; help="sizes of hidden layers of multilayer LSTM, e.g. --hidden 512 256 for a net with two LSTM layers.")
-        ("--epochs"; arg_type=Int; default=20; help="Number of epochs for training.")
+        ("--epochs"; arg_type=Int; default=10; help="Number of epochs for training.")
         ("--batchsize"; arg_type=Int; default=64; help="Number of sequences to train on in parallel.")
         ("--seqlength"; arg_type=Int; default=25; help="Number of steps to unroll the network for.")
 		("--embed"; arg_type=Int; default=512; help="Size of the embedded word vector.")
@@ -46,7 +47,8 @@ function main(args=ARGS)
         ("--gcheck"; arg_type=Int; default=0; help="Check N random gradients.")
 		("--fast"; action=:store_true; help="skip loss printing for faster run")
         ("--atype"; default=(gpu()>=0 ? KnetArray{Float32} : Array{Float32}); help="array type: Array for cpu, KnetArray for gpu")
-		("--savefile"; default="./model/nic.jld" ;help="Save final model to file")
+		("--savefile"; default="./model/nic3.jld" ;help="Save final model to file")
+		("--normalize"; action=:store_true; help="Use normalized VGG features.")
 	end
 	
 	o = parse_args(s; as_symbols=true)
@@ -93,14 +95,53 @@ function main(args=ARGS)
 
 	info("Dictionary and vocabulary are created");
 	info("The size of vocabulary is $(length(word2index))");
+	
 	w = initweights(o[:atype], o[:hidden], o[:embed], length(word2index) , o[:winit]);
 	
     state = initstate(o[:atype],o[:hidden],o[:batchsize])
 	
 	ids, data = minibatch(dict, word2index, o[:batchsize]);
+	
+	info("Loading features into memory...")
+	
+	function load_normalized_features()
+		return load("./data/Flickr30k/VGG/features/normalized_features.jld", "normalized_feature_dict")
+	end
+	
+	function load_features()
+		return load("./data/Flickr30k/VGG/features/feature_dict.jld", "feature_dict")
+	end
+	
+	global features = o[:normalize] ? load_normalized_features() : load_features()
+	
+	dict = 0
+	Knet.knetgc(); gc();
+	#Execute only once:
+	#save_vgg_outputs(convnet, ids, data, o[:batchsize])
+	#save_feature_dict(ids)
+	#save_normalized_features()
+	
+	opts = init_params(w)
+	
+	#println("Training is starting...")
+	
+	new_state = initstate(o[:atype],o[:hidden],1)
+	
+	!o[:notrain] && train(w, state, ids, data, word2index, o, opts)
 
-	#=
-	info("Loading features to the memory...")
+	#Caption of that particular image:
+	if o[:generate] > 0
+		new_state = initstate(o[:atype],o[:hidden],1)
+		generate_caption(o[:image], w, copy(new_state), word2index, o[:generate], o[:normalize])
+		println("Generating caption of the image with id: $(o[:imgid])")
+		generate_caption_from_dataset(o[:imgid], w, copy(new_state), word2index, o[:generate])
+	end
+
+end
+
+
+#Keeping all features in one field turned out to be more efficient
+function save_feature_dict(ids)
 	global features = Dict{Int64, KnetArray{Float32}}()
 	
 	count=0
@@ -118,58 +159,48 @@ function main(args=ARGS)
 	
 	save("./data/Flickr30k/VGG/features/feature_dict.jld", "feature_dict", features)
 	info("Feature dictionary is saved into jld file")
-	=#
-	
-	info("Loading features into memory...")
-	global features = load("./data/Flickr30k/VGG/features/feature_dict.jld", "feature_dict")
-	dict = 0
-	Knet.knetgc(); gc();
-	#Execute only once:
-	save_vgg_outputs(convnet, ids, data, o[:batchsize])
-	
-	opts = init_params(w)
-	
-	#println("Training is starting...")
-	
-	if o[:transfer] && o[:bestmodel] != nothing
-		info("Loading best model...")
-		w = load(o[:bestmodel], "model")
-	end
-
-	!o[:notrain] && train(w, state, ids, data, word2index, o, opts)
-
-	#Caption of that particular image:
-	if o[:generate] > 0
-		new_state = initstate(o[:atype],o[:hidden],1)
-		generate_caption(o[:image], w, copy(new_state), word2index, o[:generate])
-		println("Generating caption of the image with id: $(o[:imgid])")
-		generate_caption_from_dataset(o[:imgid], w, copy(new_state), word2index, o[:generate])
-	end
-
 end
-#=
-#Assuming seq is: [word1 word2 word3 ...]
-function loss(w,s,cout,sequence,range=1:length(sequence)-1)
-    total = 0.0; count = 0
+
+function save_normalized_features()
 	
-	rnn(w,s,cout*w[1]);
+	normalized_features = Dict{Int64,KnetArray{Float32}}()
 	
-	prediction = rnn(w,s,getStartWord(size(sequence[1],1),size(sequence[1],2))*w[end])
-	total += sum(sequence[1].*logp(prediction, 2))
+	for key in keys(features)
+		normalized_features[key] = features[key]./(sum(features[key]))
+	end
 	
-    for t in range
-		prediction = rnn(w,s,sequence[t]*w[end])
-		total += sum(sequence[t+1].*logp(prediction, 2))
-		count += size(sequence[t],1)
-    end
+	info("Saving normalized features...")
+	save("./data/Flickr30k/VGG/features/normalized_features.jld", "normalized_feature_dict", normalized_features)
+	println("FINISHED")
 	
-	prediction = rnn(w,s,sequence[end]*w[end])
-	total += sum(getEndWord(size(sequence[1],1),size(sequence[1],2)).*logp(prediction, 2))
-	count += size(sequence[end],1)
-	
-    return -total / count
 end
-=#
+
+function calculate_loss(w, state, cnnout, data, ids, batchsize)
+	total_loss = 0
+	for index in 1:length(data)
+		
+		cout = convert(KnetArray, Array(Float32, batchsize, cnnout))
+		
+		for batchno in 1:batchsize
+			id = ids[batchno,index]
+			if haskey(features, id)
+				cout[batchno, :] = features[id]
+			else 
+				println("No feature found with id: $id")
+			end
+		end
+		
+		
+		#cout = convert(o[:atype], cout)
+		batch = data[index]
+
+		total_loss += loss(w,copy(state),cout,batch)
+	end
+	
+	return total_loss/length(data)
+	
+end
+
 
 function loss(w,s,cout,sequence,range=1:length(sequence)-1)
     total = 0.0; count = 0
@@ -217,40 +248,47 @@ end
 lossgradient = grad(loss);
 
 function train(w, state, ids, sequence, word2index, o, opts; cnnout = 4096)
-	lr = o[:lr]
-	prev_id = 0
 	
 	index2word = Array(String, length(word2index));
     	for (k,v) in word2index; index2word[v] = k; end
+	
+	info("Calculating loss...")
+	current_loss = calculate_loss(w, copy(state), cnnout, sequence, ids, o[:batchsize])
+	best_loss = current_loss
+
+	println("Avg loss for initial model: ", current_loss)
+	loss_string =  "Initial model loss: $current_loss"
+	Knet.knetgc(); gc();
+	
 	for epoch = 1:o[:epochs]
+
 		println("Starting ", epoch,". epoch...")
 		for index in 1:length(sequence)
-			if index%100==1
+			if index%100==1 && index != 1
 				new_state = initstate(o[:atype],o[:hidden],1)
-				id_gen = ids[rand(1:o[:batchsize]),rand(1:1000)]
+				id_gen = ids[rand(1:end)]
 				println("Generating caption for $(id_gen): ")
 				generate_caption_from_dataset(id_gen, w, new_state, word2index, o[:generate])
+				if index%1000==1
+					println("Generating with beamsearch with beamsize 1")
+					generate_with_beam_search(id_gen, w, copy(new_state), word2index, 40, 1)
+					println("Generating with beamsearch with beamsize 5")
+					generate_with_beam_search(id_gen, w, copy(new_state), word2index, 40, 5)	
+					println("Generating with beamsearch with beamsize 10")
+					generate_with_beam_search(id_gen, w, copy(new_state), word2index, 40, 10)	
+					println("Generating with beamsearch with beamsize 20")
+					generate_with_beam_search(id_gen, w, copy(new_state), word2index, 40, 20)	
+				end
 				Knet.knetgc(); gc();
 			end
 			
-			#length(sequence[index])>20 && continue;
+			length(sequence[index])>20 && continue;
 			#println("Length of the sentence is: ", length(sequence[index]))
 			
 			cout = convert(KnetArray, Array(Float32, o[:batchsize], cnnout))
 			
 			for batchno in 1:o[:batchsize]
 				id = ids[batchno,index]
-				#=
-				feature_directory = "./data/Flickr30k/VGG/features/$(id).jld"
-				
-				if isfile(feature_directory)
-					cout[batchno, :] = load(feature_directory, "feature")
-				else
-					imageloc = "data/Flickr30k/flickr30k-images/$id.jpg";
-					cout[batchno, :] = convnet(processImage(imageloc, averageImage))
-					save(feature_directory, "feature", cout[batchno,:])
-				end
-				=#
 				cout[batchno, :] = features[id]
 			end
 			
@@ -280,38 +318,29 @@ function train(w, state, ids, sequence, word2index, o, opts; cnnout = 4096)
 				println("loss in this sentence is: ", loss(w,copy(state),cout,sentence))
 			end
 		end
+		
 		println(epoch,". epoch is finished.")
-		save(o[:savefile],"model 1 epoch $(epoch)", w, "vocab", word2index, "epochs", epoch)
+		
+		println("Calculating loss...")
+		current_loss = calculate_loss(w, copy(state), cnnout, sequence, ids, o[:batchsize])
+
+		println("Epoch $(epoch), average loss is: ", current_loss)
+		println("Best loss was: ", best_loss)
+		
+		loss_string *= "Epoch $epoch loss: $current_loss"
+		
+		file = open("model_3_loss.txt", "w")
+		write(file, loss_string)
+		close(file)
+		
+		if current_loss<best_loss
+			println("Saving model...")
+			save(o[:savefile],"model 2", w, "vocab", word2index, "epochs", epoch)
+			best_loss = current_loss
+		end
 	end
 end
 
-#=
-function prepare_data(dict, word2index)
-	vocab_size = length(word2index)
-	ids = Array(Int64, 5*length(dict));
-	data = Array{Any,1}()
-	index = 1
-	for seq in dict
-		id = seq[1];
-		no = seq[2][1];
-		words = seq[2][2];
-		
-		sentence = [ falses(1, vocab_size) for i=1:length(words)+2 ] # using BitArrays
-		
-		sentence[1][word2index["<s>"]] = 1
-		for k = 1:length(words)
-			sentence[k][word2index[words[k]]] = 1
-		end
-		sentence[end][word2index["</s>"]] = 1
-		
-		push!(data, sentence);
-		ids[index] = id;
-		index += 1;
-	end
-	
-	return ids, data
-end
-=#
 
 function save_vgg_outputs(convnet,ids,data,batchsize)
 
@@ -349,49 +378,6 @@ function init_params(model)
 	return prms
 end
 
-#=
-function minibatch(dict, word2index, batchsize)
-	vocab_size = length(word2index)
-	
-	ids = Array(Int64, batchsize, div(length(dict),batchsize)); #An upperbound for the size of the ids
-	data = Array{Any,1}()
-	index = 1
-	count = 1
-	
-	while true
-		index>length(dict)-batchsize+1 && break
-		
-		seq = dict[index];
-		id = seq[1];
-		len = seq[2];
-		words = seq[3];
-		if dict[index+batchsize-1][2] != len
-			index += 1;
-			continue;
-		end
-		
-		sentence = [ falses(batchsize, vocab_size) for j=1:length(words) ] # using BitArrays
-		for i in index:index+batchsize-1
-			seq = dict[i];
-			id = seq[1];
-			len = seq[2];
-			words = seq[3];
-			for k = 1:len
-				sentence[k][i-index+1,word2index[words[k]]] = 1
-			end
-			
-			ids[i-index+1,count] = id;
-		end
-		push!(data, sentence);
-
-		count += 1
-		index += batchsize
-	end
-	shuffle!(data)
-	info("Minibatch completed with $count batches of size $batchsize")
-	return ids, data
-end
-=#
 
 function minibatch(dict, word2index, batchsize)
 	vocab_size = length(word2index)
@@ -432,18 +418,22 @@ function minibatch(dict, word2index, batchsize)
 	#shuffle!(data)
 	order = randperm(length(data))
 	data = data[order];
-	ids = ids[:,order]
+	ids = ids[:,order];
 	info("Minibatch completed with $count batches of size $batchsize")
 	return ids, data
 end
 
-function generate_caption(dirImage, w, state, word2index, nwords)
-	index2word = Array(String, length(word2index));
-    	for (k,v) in word2index; index2word[v] = k; end
+function generate_caption(dirImage, w, state, word2index, nwords, normalized=false)
 	
 	img = processImage(dirImage, averageImage)
-	inputRNN = convnet(img)*w[1]
+	cnnout = convnet(img)
 	
+	if normalized
+		inputRNN = (cnnout./sum(cnnout))*w[1]
+	else
+		inputRNN = cnnout*w[1]
+	end
+		
 	input = rnn(w, state, inputRNN)
 	input = getStartWord(1, length(word2index))
 	index = 1
@@ -461,14 +451,14 @@ function generate_caption(dirImage, w, state, word2index, nwords)
 end
 
 function generate_caption_from_dataset(id, w, state, word2index, nwords)
-	index2word = Array(String, length(word2index));
-    	for (k,v) in word2index; index2word[v] = k; end
 	
-	filename = "./data/Flickr30k/VGG/features/$id.jld"
+	#filename = "./data/Flickr30k/VGG/features/$id.jld"
 	
-	!isfile(filename) && return;
+	#!isfile(filename) && return;
 	
-	inputRNN = convert(KnetArray{Float32}, load(filename,"feature"))*w[1]
+	!haskey(features,id) && return;
+	
+	inputRNN = features[id]*w[1]
 	
 	input = rnn(w, state, inputRNN)
 	input = getStartWord(1, length(word2index))
@@ -484,6 +474,164 @@ function generate_caption_from_dataset(id, w, state, word2index, nwords)
 		print(index2word[index], " ")
 		input[index] = 1
     end
+	println();
+end
+
+function split_data()
+	
+
+
+end
+
+#A bad implementation of beam search
+#TODO: write this function better
+function generate_with_beam_search(id, w, state, word2index, nwords, beamsize)
+
+	!haskey(features,id) && return;
+	
+	inputRNN = features[id]*w[1]
+	
+	rnn(w, state, inputRNN)
+	
+	probs = ones(Float32, beamsize,1)
+	
+	#words = Array{Array{Int,1},1}()
+	words = [[1] for i in 1:beamsize]
+
+	states = [copy(state) for i in 1:beamsize]
+	probs = ones(Float64, beamsize, 1)
+
+	ynorms = convert(KnetArray{Float32}, zeros(Float32, beamsize, length(word2index)))
+
+	function findbestk(x, probs, ended)
+		pq = Collections.PriorityQueue([],[],Base.Order.Forward)
+		
+		for j in 1:beamsize
+			pq[(1, j)] = probs[1]*x[j]
+		end
+
+		
+		for i in 1:beamsize
+			if ended[i]
+				if probs[i]>Base.Collections.peek(pq)[2] && !haskey(pq, (i,2))
+					Base.Collections.dequeue!(pq)
+					Base.Collections.enqueue!(pq, (i,2), probs[i])
+				end
+				#println("PQ after $i. iteration")
+				#println(pq)
+				continue;
+			end
+			
+			for j in 1:size(x,2)
+				i==1 && j<=beamsize && continue;
+				if probs[i]*x[i,j]>Base.Collections.peek(pq)[2] && !haskey(pq, (i,j))
+					Base.Collections.dequeue!(pq)
+					Base.Collections.enqueue!(pq, (i,j), probs[i]*x[i,j])
+				end
+			end
+			#println("PQ after $i. iteration")
+			#println(pq)
+		end
+		
+		#println("PQ is: ", pq)
+		return pq
+	end
+	
+	function initialfindbestk(x)
+		pq = Collections.PriorityQueue([],[],Base.Order.Forward)
+		
+		count = 1
+		for j in 1:beamsize
+			pq[(count, j)] = x[1,j]
+			count += 1
+		end
+		
+		
+		for j in beamsize+1:size(x,2)
+			if x[1,j]>Base.Collections.peek(pq)[2]
+				min = Base.Collections.dequeue!(pq)
+				Base.Collections.enqueue!(pq, (min[1][1],j), x[1,j])
+			end
+		end
+		#=
+		result = Collections.PriorityQueue([],[],Base.Order.Forward)
+		count = 1
+		for key in keys(pq)
+			Base.Collections.enqueue!(result, (count,key[2]), pq[key])
+			count += 1
+		end
+		=#
+		#println("Initial PQ: ")
+		#println(pq)
+		return pq
+	end
+	
+	pq = Collections.PriorityQueue([],[],Base.Order.Forward)
+	
+	ended = falses(beamsize)
+	
+	for t in 1:nwords
+		length(ended) == sum(ended) && break;
+		state_flags = trues(beamsize)
+		#println(words)
+		#println("Ended: ", ended)
+		for i in 1:beamsize
+			if !ended[i]
+				ypred = rnn(w, states[i], w[end][[words[i][t]],:])
+				ynorms[i,:] = exp(logp(ypred))
+			end
+		end
+		
+		pq = t==1 ? initialfindbestk(ynorms) : findbestk(ynorms, probs, ended)
+		
+		new_states = typeof(states)()
+		new_words = Array{Array{Int,1},1}()
+		new_ended = falses(beamsize)
+						
+		sorted_pairs = sort(collect(pq), by=x->x[2], rev=true)
+		
+		count = 1
+		
+		#new_ynorms = similar(ynorms)
+		for pair in sorted_pairs
+			i = pair[1][1]
+			j = pair[1][2]
+			p = pair[2]
+			
+			if state_flags[i]
+				push!(new_states,states[i])
+				state_flags[i] = false
+			else
+				push!(new_states,copy(states[i]))
+			end
+			
+			probs[count] = p
+			push!(new_words, [words[i]; j])
+			new_ended[count] = ended[i]
+			#=
+			if new_ended[count]
+				new_ynorms[count,:] = ynorms[i,:]
+			end
+			=#
+			if(j==2) new_ended[count]=true end
+			count += 1
+		end
+		
+		#println("Probabilities: ", probs)
+		states = new_states
+		words = new_words
+		ended = new_ended
+		#ynorms = new_ynorms
+    end
+	
+	for i in 2:length(words[1])
+		word = index2word[words[1][i]]
+		if(word=="</s>")
+			println();
+			return;
+		end
+		print(word, " ")
+	end
 	println();
 end
 
