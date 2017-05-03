@@ -145,8 +145,12 @@ function main(args=ARGS)
 	dict = 0; train_dict = 0; valid_dict = 0; test_dict = 0;
 	Knet.knetgc(); gc();
 	
-	o[:bleu] && bleu(test_data, test_ids, w, copy(valstate), beamsize=1)
+	#val_loss = calculate_loss(w, copy(valstate), o[:cnnout], valid_data, valid_ids, 1, o[:check])		
+	Knet.knetgc(); gc();
 	
+	#println("Validation loss: ", val_loss)
+	
+	o[:bleu] && bleu(test_data, test_ids, w, copy(valstate), beamsize=20)
 	
 	#Execute only once:
 	#save_Flickr30k_features()
@@ -164,7 +168,7 @@ function main(args=ARGS)
 		new_state = initstate(o[:atype],o[:hidden],1)
 		generate_caption(o[:image], w, copy(new_state), word2index, o[:generate]; normalized = o[:normalize])
 		println("Generating caption of the image with id: $(o[:imgid])")
-		generate_caption(o[:imgid], w, copy(new_state), word2index, o[:generate])
+		generate_caption(o[:imgid], w, copy(new_state), word2index,	o[:generate])
 	end
 
 end
@@ -197,12 +201,12 @@ function bleu(test_data,test_ids,w,state;batchsize=1, beamsize=5, cnnout=4096)
 	
 	close(hypothesis)
 	
-	id_strings = Dict{Int64,Array{Array{String,1},1}}();
+	id_strings = Dict{Int64,Any}();
 	
 	for index in 1:length(test_data)
 		id = test_ids[index]
-		sentences = get!(id_strings, id, [])
-		push!(sentences,map(k->get(word2index,k,"</u>"), test_data[index][1:end]))
+		get!(id_strings, id, [])
+		push!(id_strings[id], test_data[index])
 	end
 	
 	info("Strings are put into the dict")
@@ -210,7 +214,7 @@ function bleu(test_data,test_ids,w,state;batchsize=1, beamsize=5, cnnout=4096)
 	for i=1:5
 		for id in id_array
 			for j=1:length(id_strings[id][i])
-				write(refs[i], id_strings[id][i][j], " ")
+				write(refs[i], index2word[id_strings[id][i][j][1]], " ")
 			end
 			write(refs[i], "\n")
 		end
@@ -633,7 +637,7 @@ end
 function init_params(model)
 	prms = Array(Any, length(model))
 	for i in 1:length(model)
-		prms[i] = Adam(;lr=0.0001)
+		prms[i] = Adam()
 	end
 	return prms
 end
@@ -684,7 +688,7 @@ function minibatch(dict, batchsize)
 end
 
 
-function generate_caption(img, w, state, word2index, nwords, normalized=false, file=nothing)
+function generate_caption(img, w, state, word2index, nwords; normalized=false, file=nothing)
 	if typeof(img)==String
 		img = processImage(img, averageImage)
 		cnnout = convnet(img)
