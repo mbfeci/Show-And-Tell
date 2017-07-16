@@ -24,17 +24,18 @@ include("parser.jl");
 
 const imgurl = "https://github.com/BVLC/caffe/raw/master/examples/images/cat.jpg"
 const dogurl = "http://cdn.wallpapersafari.com/18/70/GHrovc.jpg"
+
 const vggurl = "http://www.vlfeat.org/matconvnet/models/imagenet-vgg-verydeep-16.mat"
+const LAYER_TYPES = ["conv", "relu", "pool", "fc", "prob"]
+
 const caption_file = "data/Flickr30k/Flickr30kText/results_20130124.token"
 const caption_file_cocotrain =  "data/MSCOCO/annotations/captions_train2014.json"
 const caption_file_cocoval = "data/MSCOCO/annotations/captions_val2014.json"
-const LAYER_TYPES = ["conv", "relu", "pool", "fc", "prob"]
-
 
 function main(args=ARGS)
 	
 	s = ArgParseSettings()
-    s.description="vgg.jl (c) Mehmed Burak Demirci, 2017. Implementation of the model in the following paper: https://arxiv.org/pdf/1411.4555.pdf ."
+    s.description="nic.jl (c) Mehmed Burak Demirci, 2017. Implementation of the model in the following paper: https://arxiv.org/pdf/1411.4555.pdf ."
     # s.exc_handler=ArgParse.debug_handler
     @add_arg_table s begin
 		("image"; default=imgurl; help="Image file or URL.")
@@ -66,23 +67,6 @@ function main(args=ARGS)
 	end
 	
 	o = parse_args(s; as_symbols=true)
-	
-	#=
-	o = Dict();
-	o[:model] = Knet.dir("data","imagenet-vgg-verydeep-16.mat")
-	o[:atype] = KnetArray{Float32};
-	o[:hidden] = [512];
-	o[:embed] = 512;
-	o[:batchsize] = 50;
-	o[:lr] = 0.1;
-	o[:decay] = 0.5;
-	o[:winit] = 0.1;
-	o[:epochs] = 3;
-	o[:generate] = 100;
-	o[:image] = imgurl
-	o[:gclip] = 3.0
-	o[:fast] = false
-	=#
 	
 	println("opts=",[(k,v) for (k,v) in o]...)
 	
@@ -166,9 +150,9 @@ function main(args=ARGS)
 	#Caption of that particular image:
 	if o[:generate] > 0
 		new_state = initstate(o[:atype],o[:hidden],1)
-		generate_caption(o[:image], w, copy(new_state), word2index, o[:generate]; normalized = o[:normalize])
+		generate_caption_sample(o[:image], w, copy(new_state), word2index, o[:generate]; normalized = o[:normalize])
 		println("Generating caption of the image with id: $(o[:imgid])")
-		generate_caption(o[:imgid], w, copy(new_state), word2index,	o[:generate])
+		generate_caption_sample(o[:imgid], w, copy(new_state), word2index,	o[:generate])
 	end
 
 end
@@ -230,8 +214,6 @@ function save_Flickr30k_features()
 	
 	flickr30k_features = Dict{Int64, Array{Float32}}()
 	
-	#flickr30k_features = load("./data/Flickr30k/VGG/features/feature_dict.jld", "feature_dict")
-	
 	dir = readdir("data/Flickr30k/flickr30k-images")
 	
 	index = 1
@@ -241,7 +223,6 @@ function save_Flickr30k_features()
 
 		id = parse(Int64,imgloc[rsearch(imgloc,'_')+1:rsearch(imgloc,'.')-1])
 		if !haskey(coco_features, id)
-			#println("ID is $id")
 
 			img = processImage(filename, averageImage)
 		    cout = convnet(img)
@@ -528,7 +509,7 @@ function train(w, state, valstate, train_ids, train_data, valid_ids, valid_data,
 				id_train = train_ids[rand(1:end)]
 				println("Generating caption for $(id_train) in train: ")
 
-				generate_caption(id_train, w, copy(new_state), word2index, o[:generate])
+				generate_caption_sample(id_train, w, copy(new_state), word2index, o[:generate])
 				if index%1000==1
 					println("Generating with beamsearch with beamsize 1")
 					generate_with_beam_search(id_train, w, copy(new_state), word2index, 40, 1)
@@ -543,7 +524,7 @@ function train(w, state, valstate, train_ids, train_data, valid_ids, valid_data,
 				id_val = valid_ids[rand(1:end)]
 				println("Generating caption for $(id_val) in validation: ")
 				
-				generate_caption(id_val, w, copy(new_state), word2index, o[:generate])
+				generate_caption_sample(id_val, w, copy(new_state), word2index, o[:generate])
 				if index%1000==1
 					println("Generating with beamsearch with beamsize 1")
 					generate_with_beam_search(id_val, w, copy(new_state), word2index, 40, 1)
@@ -688,7 +669,7 @@ function minibatch(dict, batchsize)
 end
 
 
-function generate_caption(img, w, state, word2index, nwords; normalized=false, file=nothing)
+function generate_caption_sample(img, w, state, word2index, nwords; normalized=false, file=nothing)
 	if typeof(img)==String
 		img = processImage(img, averageImage)
 		cnnout = convnet(img)
@@ -879,14 +860,14 @@ function getStartWord(batchsize, vocabsize; atype = KnetArray{Float32})
 	return x
 end
 
-
+#=
 function getEndWord(batchsize, vocabsize; atype = KnetArray{Float32})
 	x = zeros(Float32, batchsize,vocabsize)
 	x[:,2] = 1
 	x = convert(atype, x)
 	return x
 end
-
+=#
 
 # state[2k-1]: hidden for the k'th lstm layer
 # state[2k]: cell for the k'th lstm layer
@@ -920,27 +901,6 @@ function initweights(atype, hidden, input, vocab, winit, cout=4096)
     return map(k->convert(atype,k), w)
 end
 
-
-#=
-function xavier(a...)
-    w = rand(a...)
-     # The old implementation was not right for fully connected layers:
-     # (fanin = length(y) / (size(y)[end]); scale = sqrt(3 / fanin); axpb!(rand!(y); a=2*scale, b=-scale)) :
-    if ndims(w) < 2
-        error("ndims=$(ndims(w)) in xavier")
-    elseif ndims(w) == 2
-        fanout = size(w,1)
-        fanin = size(w,2)
-    else
-        fanout = size(w, ndims(w)) # Caffe disagrees: http://caffe.berkeleyvision.org/doxygen/classcaffe_1_1XavierFiller.html#details
-        fanin = div(length(w), fanout)
-    end
-    # See: http://jmlr.org/proceedings/papers/v9/glorot10a/glorot10a.pdf
-    s = sqrt(2 / (fanin + fanout))
-    w = 2s*w-s
-end
-=#
-
 function init_rnn_weights(hidden, vocab, embed)
     model = Array(Any, 2*length(hidden)+3)
     X = embed
@@ -957,40 +917,6 @@ function init_rnn_weights(hidden, vocab, embed)
 	model[end] = xavier(vocab,embed)	#We (word embedding vector)
     return model
 end
-
-#=
-function init_cnn_weights(winit, embed)
-
-	#=VGG ConvNet parameters
-	w = Any[ -0.1+winit*rand(Float32, 3,3,3,64),  zeros(Float32,1,1,64,1),
-	-0.1 + winit*rand(Float32,3,3,64,128), zeros(Float32,1,1,128,1),
-	-0.1 + winit*rand(Float32,3,3,128,256), zeros(Float32,1,1,256,1),		
-	-0.1 + winit*rand(Float32,3,3,256,256), zeros(Float32,1,1,256,1),
-	-0.1 + winit*rand(Float32,3,3,256,512), zeros(Float32,1,1,512,1),
-	-0.1 + winit*rand(Float32,3,3,512,512), zeros(Float32,1,1,512,1)]
-	=#
-	#For baseline model, a simple ConvNet is used.
-	w = Any[ -0.1+winit*rand(Float32, 5,5,3,10),  zeros(Float32,1,1,10,1),
-	-0.1 + winit*rand(Float32,5,5,10,10), zeros(Float32,1,1,10,1),
-	-0.1 + winit*rand(Float32,5,5,10,10), zeros(Float32,1,1,10,1),
-	-0.1 + winit*rand(Float32,5,5,10,10), zeros(Float32,1,1,10,1),
-	-0.1 + winit*rand(Float32,1960,embed), zeros(Float32,1,embed)]; 
-
-	return w
-end
-=#
-
-#=
-#Input size is 224x224x3x1
-function simpleConvNet(w, x)
-	x1 = pool(relu(conv4(w[1], x; stride = 1, padding = 2).+w[2]);window = 2, stride = 2)
-	x2 = pool(relu(conv4(w[3], x1; stride = 1, padding = 2).+w[4]);window = 2, stride = 2)
-	x3 = pool(relu(conv4(w[5], x2; stride = 1, padding = 2).+w[6]);window = 2, stride = 2)
-	x4 = pool(relu(conv4(w[7], x3; stride = 1, padding = 2).+w[8]);window = 2, stride = 2)
-
-	return mat(x4)'*w[9] .+ w[10];
-end
-=#
 
 function lstm(weight,bias,hidden,cell,input)
     gates   = hcat(input,hidden) * weight .+ bias
